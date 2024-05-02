@@ -1,0 +1,273 @@
+---
+title: "Fixed Effects Linear Modelling"
+author: "Euan McDonnell"
+date: "2023-08-01"
+output: html_document
+---
+
+
+## Notes
+
+## Code
+
+### Reset environment
+
+```{r}
+
+rm(list=ls(all.names=T));
+
+```
+
+### Libraries
+
+```{r}
+
+# Run script to get and install libraries
+source("get_libraries.R")
+
+# Get required packages that can be installed normally
+lib_list <- GetLibsFromJSON(path_name="package_dependencies/", dependencies=TRUE)
+
+```
+
+### Parameters
+
+```{r}
+
+# Toggle to drop outliers idenitifed via NMDS
+drop_outliers <- FALSE
+mixed_is_formula <- FALSE
+
+```
+
+### Define directories
+
+```{r}
+
+# Toggle if 
+if (drop_outliers) {
+  
+  # Define directories with outliers removed
+  scripts_dir <- paste0(getwd(), "/")
+  main_dir <- paste0(scripts_dir, "../")
+  data_dir <- paste0(main_dir, "01_data/")
+  res_dir <- paste0(main_dir, "03_results/", 
+                    ifelse(mixed_is_formula,
+                           "mixed_formula_combined/",
+                           "feeding_separate/"))
+  eda_dir <- paste0(res_dir, "eda/")
+  lm_dir <- paste0(res_dir,"fixed_effects_models/")
+  
+} else {
+  
+  # Directories
+  scripts_dir <- paste0(getwd(), "/")
+  main_dir <- paste0(scripts_dir, "../")
+  data_dir <- paste0(main_dir, "01_data/")
+  res_dir <- paste0(main_dir, "03_results/", 
+                    ifelse(mixed_is_formula,
+                           "mixed_formula_combined/",
+                           "feeding_separate/"))
+  eda_dir <- paste0(res_dir, "eda/")
+  lm_dir <- paste0(res_dir, "fixed_effects_models/")
+  
+}
+
+# Make directories
+for (directory in c(scripts_dir, res_dir, eda_dir, lm_dir)) { dir.create(directory, recursive = TRUE, showWarnings=FALSE) }
+
+```
+
+### Source extra functions
+
+```{r}
+
+# Source script with extra functions in
+source(paste0(scripts_dir, "extra_functions.R"))
+
+```
+
+#### Read in data
+
+```{r}
+
+# Read in data
+all_data <- read.csv(paste0(data_dir,"all_data.combined_mbiome_metadata.tsv"), sep="\t", header=TRUE)
+metadata <- read.csv(paste0(data_dir,"sample_metadata.tsv"), sep="\t", header=TRUE)
+tall.mbiome_data <- read.table(paste0(data_dir,"microbiome_cfus_data.tall_format.zero_cfu_orgs_removed.tsv"), sep="\t", header=TRUE)
+
+# Set patient IDs to factors
+tall.mbiome_data$PATIENT_ID <- as.character(tall.mbiome_data$PATIENT_ID)
+metadata$PATIENT_ID <- as.character(metadata$PATIENT_ID)
+all_data$PATIENT_ID <- as.character(all_data$PATIENT_ID)
+
+# Read in organisms detected (CFU > 0) in any sample
+nonzero.sum_cfu <- readRDS(paste0(main_dir,"03_results/undetected_organisms.rds")) 
+
+```
+
+### Colours
+
+```{r}
+
+# Get organism colours
+org_colors <- hue_pal()(length(unique(tall.mbiome_data$ORGANISM)))
+names(org_colors) <- unique(tall.mbiome_data$ORGANISM)
+
+# Weeks
+week_colors <- c("#FEE391", "#EC7014", "#662506"); names(week_colors) <- unique(all_data$Weeks)
+sig.week_colors <- c(week_colors,"NS"="darkgrey")
+
+# Weeks (significant)
+
+```
+
+## Linear modelling
+
+### Get data properly formatted
+
+```{r}
+
+# Merge with metadata
+for_lm.data <- all_data
+
+# Fix organism names
+colnames(for_lm.data) <- gsub("\n"," ",colnames(for_lm.data))
+
+# Get weens as just number
+for_lm.data["WEEKS"] <- as.numeric(gsub("_week","",for_lm.data$Weeks))
+
+# Z-scale data
+for_lm.data["Z_STOOL_NUMBER"] <- scale(for_lm.data$stool_amount, center=TRUE, scale=TRUE)
+for_lm.data["Z_BIRTHWEIGHT"] <- scale(for_lm.data$Birthweight, center=TRUE, scale=TRUE)
+for_lm.data["Z_MOM_AGE"] <- scale(for_lm.data$Mother.s.age, center=TRUE, scale=TRUE)
+for_lm.data["Z_GESTATION_AGE"] <- scale(for_lm.data$Gestation.age, center=TRUE, scale=TRUE)
+for_lm.data["Z_ECOLI"] <- scale(for_lm.data$Total_count_of_Escherichia_coli, center=TRUE, scale=TRUE)
+for_lm.data["Z_CONDI"] <- scale(for_lm.data$conditionally_pathogenic_microflora, center=TRUE, scale=TRUE)
+for_lm.data["Z_LACTO"] <- scale(for_lm.data$lactobacteria, center=TRUE, scale=TRUE)
+for_lm.data["Z_BIFID"] <- scale(for_lm.data$bifidobacteria, center=TRUE, scale=TRUE)
+for_lm.data["Z_ECOLI_ENZ"] <- scale(for_lm.data$Escherichia_coli_with_weakly_expressed_enzyme__Ability, center=TRUE, scale=TRUE)
+
+# Scale calprotectine per week
+for_lm.data["Z_CALPROTECTINE"] <- for_lm.data$calprotectine
+for_lm.data["Sqrt_calprotectine"] <- for_lm.data$calprotectine
+for_lm.data["Z_SQRT_CALPROTECTINE"] <- for_lm.data$calprotectine
+for (week in unique(for_lm.data$WEEKS)) {
+  
+  # Scale at the week level
+  for_lm.data[for_lm.data$WEEKS == week,]["Z_CALPROTECTINE"] <- scale(for_lm.data[for_lm.data$WEEKS == week,]$calprotectine, center=TRUE, scale=TRUE)
+  for_lm.data[for_lm.data$WEEKS == week,]["Sqrt_calprotectine"] <- sqrt(for_lm.data[for_lm.data$WEEKS == week,]$calprotectine)
+  for_lm.data[for_lm.data$WEEKS == week,]["Z_SQRT_CALPROTECTINE"] <- scale(for_lm.data[for_lm.data$WEEKS == week,]$Sqrt_calprotectine, center=TRUE, scale=TRUE)
+  
+}
+
+```
+
+### Split per time point
+
+Compare covariates to calprotectin at each level of time point (2, 3 and 5 weeks)
+
+Very simple model of Calprotectin ~ Feeding + Weight gives sig on weight at weeks = 3. Inclusion of gender removes this. Also (excluding gender), at weeks = 5, it is close to sig.
+
+```{r}
+
+bonf_pval <- 0.05 / length(unique(for_lm.data$WEEKS))
+
+# Fit linear model CALPROTECTINE ~ FEEDING + Z_BIRTHWEIGHT, splitting measurements by weeks
+perweek.lm_coef.df <- GroupwiseLMs(for_lm.data[,!grepl("Birthweight|Feeding|^Calprotectine|calprotectine",colnames(for_lm.data))], group_fct1="WEEKS", conf_level=bonf_pval,
+                                   predictor=c("FEEDING","Z_BIRTHWEIGHT","Gender","Delivery"), 
+                                   response="Z_SQRT_CALPROTECTINE", just_coef=TRUE, width=2500, height=600, dir=lm_dir,
+                                   file_suffix=".weekwise_models.patientwise_covariates.fixeff_coefficients.dwplt.png")
+perweek.lm_model.df <- GroupwiseLMs(for_lm.data[,!grepl("Birthweight|Feeding|^Calprotectine|calprotectine",colnames(for_lm.data))], group_fct1="WEEKS", conf_level=bonf_pval,
+                                    predictor=c("FEEDING","Z_BIRTHWEIGHT","Gender","Delivery"),
+                                    response="Z_SQRT_CALPROTECTINE", just_coef=FALSE, width=2500, height=600, dir=lm_dir,
+                                    file_suffix=".weekwise_models.patientwise_covariates.fixeff_coefficients.dwplt.png")
+
+```
+
+```{r}
+
+bonf_pval <- 0.05 / length(unique(for_lm.data$WEEKS))
+
+# Fit linear model CALPROTECTINE ~ FEEDING + Z_BIRTHWEIGHT, splitting measurements by weeks
+perweek.lm_coef.df <- GroupwiseLMs(for_lm.data, group_fct1="WEEKS", conf_level=bonf_pval,
+                                   predictor=c("FEEDING","Z_BIRTHWEIGHT","Gender","Delivery","Z_CONDI","Z_BIFID","Z_LACTO","Z_ECOLI"), 
+                                   response="Z_SQRT_CALPROTECTINE", just_coef=TRUE, width=2500, height=1000, dir=lm_dir,
+                                   file_suffix=".weekwise_models.inc_organisms.fixeff_coefficients.dwplt.png")
+perweek.lm_model.df <- GroupwiseLMs(for_lm.data, group_fct1="WEEKS", conf_level=bonf_pval,
+                                    predictor=c("FEEDING","Z_BIRTHWEIGHT","Gender","Delivery","Z_CONDI","Z_BIFID","Z_LACTO","Z_ECOLI"), 
+                                    response="Z_SQRT_CALPROTECTINE", just_coef=FALSE, width=2500, height=1000, dir=lm_dir,
+                                    file_suffix=".weekwise_models.inc_organisms.fixeff_coefficients.dwplt.png")
+
+```
+
+
+
+
+
+### Including time in model
+
+#### Split by patient
+
+```{r}
+
+plt <- ggplot(tall.mbiome_data, aes(x=WEEKS, y=CFU, color=ORGANISM, fill=ORGANISM, group=ORGANISM)) + 
+              geom_smooth(data=tall.mbiome_data, aes(x=WEEKS, y=CFU, group=ORGANISM), method="lm", se=FALSE) +  
+              geom_point(color="black", shape=21) + 
+              scale_fill_manual(values=org_colors) + scale_color_manual(values=org_colors) +
+              facet_wrap( ~ PATIENT_ID, ncol=8) +
+              scale_y_continuous(breaks=seq(0, max(tall.mbiome_data$CFU), 2)) +
+              scale_x_continuous(breaks=c(2,3,5)) +
+              theme_bw(base_size=16) + theme(legend.position="none",
+                                             axis.title=element_text(size=24))
+
+# Save
+ggsave(paste0(lm_dir, "organism_vs_weeks.colby_organism.split_by_patient.regression_lineplt.png"), width=3000, height=3000, units="px")
+
+plt <- ggplot(tall.mbiome_data, aes(x=CFU, y=CALPROTECTINE,color=ORGANISM, fill=ORGANISM, group=ORGANISM)) + 
+              geom_smooth(data=tall.mbiome_data, aes(x=CFU, y=CALPROTECTINE,group=ORGANISM), method="lm", se=FALSE) +  
+              geom_point(color="black", shape=21) +
+              scale_fill_manual(values=org_colors) + scale_color_manual(values=org_colors) + 
+              facet_wrap( ~ PATIENT_ID, ncol=8) +
+              scale_y_continuous(breaks=seq(0, max(tall.mbiome_data$CFU), 2)) +
+              # scale_x_continuous(breaks=c(2,3,5)) +
+              theme_bw(base_size=16) + theme(legend.position="none",
+                                             axis.title=element_text(size=24))
+
+# Save
+ggsave(paste0(lm_dir, "organism_vs_calprotectine.colby_organism.split_by_patient.regression_lineplt.png"), width=4000, height=2000, units="px")
+
+```
+
+#### Split by organism
+
+```{r}
+
+plt <- ggplot(tall.mbiome_data, aes(x=WEEKS, y=CFU, color=PATIENT_ID, fill=PATIENT_ID, group=PATIENT_ID)) + 
+              geom_smooth(data=tall.mbiome_data, aes(x=WEEKS, y=CFU, group=PATIENT_ID), method="lm", se=FALSE) +  
+              geom_point(color="black", shape=21) + 
+              facet_wrap( ~ ORGANISM, ncol=5) +
+              scale_y_continuous(breaks=seq(0, max(tall.mbiome_data$CFU), 2)) +
+              scale_x_continuous(breaks=c(2,3,5)) +
+              theme_bw(base_size=16) + theme(legend.position="none",
+                                             axis.title=element_text(size=24))
+
+# Save
+ggsave(paste0(lm_dir, "organism_vs_weeks.colby_patient.split_by_organism.regression_lineplt.png"), width=2000, height=4000, units="px")
+
+plt <- ggplot(tall.mbiome_data, aes(x=CFU, y=CALPROTECTINE, color=PATIENT_ID, fill=PATIENT_ID, group=PATIENT_ID)) + 
+              geom_smooth(data=tall.mbiome_data, aes(x=CFU, y=CALPROTECTINE,group=PATIENT_ID), method="lm", se=FALSE) +  
+              geom_point(color="black", shape=21) + 
+              facet_wrap( ~ ORGANISM, ncol=5) +
+              scale_y_continuous(breaks=seq(0, max(tall.mbiome_data$CFU), 2)) +
+              # scale_x_continuous(breaks=c(2,3,5)) +
+              theme_bw() + theme(legend.position="none",
+                                             axis.title=element_text(size=24))
+
+
+# Save
+ggsave(paste0(lm_dir, "organism_vs_calprotectine.colby_patient.split_by_organism.regression_lineplt.png"), width=4000, height=3000, units="px")
+
+```
+
+

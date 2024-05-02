@@ -1,0 +1,14 @@
+# Hidden
+**/*Rproj_user
+**/*DS_store
+**/*.Rhistory
+
+# Data
+**/dataForPaper/*
+**/*data*/*
+**/01_data/*
+**/03_results/*
+
+# Meetings/presentations/notes
+**/meetings*/*
+

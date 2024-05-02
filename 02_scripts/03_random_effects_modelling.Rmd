@@ -1,0 +1,676 @@
+---
+title: "Modelling"
+author: "Euan McDonnell"
+date: "2023-07-12"
+output: html_document
+---
+
+## Mixed linear model
+
+### Notes
+
+#### Dispersion
+
+Based on: https://scialert.net/fulltext/?doi=ajms.2010.1.15#:~:text=The%20negative%20binomial%20distribution%20(NB,is%20known%2C%20many%20simplifications%20result.
+
+* Over-dispersion is when variance > mean in count data - likely best modelled by a Negative Binomial (NB) distribution. In this ($\mu$ is mean, $\sigma^2$ is variance and $\psi$ is dispersion parameter):
+
+$$\sigma^2 = \frac{\mu + \mu^2 }{ \psi }$$
+
+* Can determine $\psi$ via MLE, method of moments estimator (MME), maximum quasi-likelihood estimators (MQLE). MME is recomended for small sample sizes (< 20), MLE when $\mu \gt \sigma^2$. With adequate sample size (>20) and $\alpha = 1 / \psi$ is small, MQLE is preferred vs MLE. MQLE is preferred when sample $\sigma^2$ is near population $\mu$. When $\mu$ is small, $\sigma^2$ is large, MME has lower bias and may perform the best.
+* Tend to determine $\psi$ by MLE, but tends to only work when $\sigma^2 \gg \mu$. If $\sigma^2 \le \mu$ or if $\sigma^2 > \mu$ (under-dispersed) then it fails as MLE estimates don't exist as the log likelihood function is asymptotic with no maximum. Similar if $\mu = 0$ as $\sigma^2 = \mu = 0$. But can instead solve for $\psi$'s reciprocal, $\alpha = \frac{1}{\psi}$ as this deals with the issue of $MLE = \inf$ when $\sigma^2 = \mu$.
+* When $\sigma^2$ is only slightly larger than $\mu$, then $\psi$ can be calculated to be very large, when the true value is much smaller.
+
+#### Model fitting
+
+* ```{r}boundary (singular) fit: see help('isSingular')``` error refers to when the fitted mixed model has estimated parameters onn the boundary of the feasible parameter space: or that variances of one or more linear cominations of effects are (close to) zero. The estimated variance-covariance matrices are less than full rank. AKA some "dimensions" of the variance-covariance matrix are estimated to be exactly 0. Easy to detect for simple models (ie <3 paramters, such as intercept + slope) but not more complex models (>=3 parameters) as models can be singular without individual variances being close to zero. ```{r}isSingular()``` helps mitigate some of this. Uses ```{r}rePCA()``` function on var-cov matrix to isolate and inspect orthogonal variance components by looking at their stdevs and mapping these to variance terms.
+* Problems this causes are:
+  * Singular fits may correspond to overfitted models with poor power.
+  * Numerical problems/mis-convergences may be higher for singular models.
+  * May be difficult to compute profile confidence intervals
+  * Inferential statistics such as Wald statistics or LRTs may be innappropriate.
+* No consensus on how to deal with them. Generally recommended to:
+  * Simplify models (and underlying data) as much as possible.
+  * Model selection to balance predictive accuracy with overfitting/Type I error
+  * "keep it maximal" - i.e. fit the most complex model consistent with the experimental design, removing only terms required to allow a non-singular fit (Barr et al. 2013), or removing further terms based on p-values or AIC
+  * Use a partial Bayesian method to produce MAP estimates using regularizing priors to force estimated random-effects variance-covariance matrices away from singularity (ie `blme` package.
+  * Use a full Bayesian method to regularise the model via informative priors and give estimates/credible intervals for all parameters that average over the uncertainty in random effects paramters (`MCMCglmm`, `rstanarm`, `brms`).
+
+
+### Code
+
+#### Libraries
+
+```{r}
+
+# Run script to get and install libraries
+source("get_libraries.R")
+
+# Get required packages that can be installed normally
+lib_list <- GetLibsFromJSON(path_name="package_dependencies/", dependencies=TRUE)
+
+```
+
+### Parameters
+
+```{r}
+
+# Toggle to drop outliers idenitifed via NMDS
+drop_outliers <- FALSE
+mixed_is_formula <- TRUE
+
+```
+
+### Define directories
+
+```{r}
+
+# Toggle if 
+if (drop_outliers) {
+  
+  # Define directories with outliers removed
+  scripts_dir <- paste0(getwd(), "/")
+  main_dir <- paste0(scripts_dir, "../")
+  data_dir <- paste0(main_dir, "01_data/")
+  res_dir <- paste0(main_dir, "03_results/", 
+                    ifelse(mixed_is_formula,
+                           "mixed_formula_combined/",
+                           "feeding_separate/"))
+  eda_dir <- paste0(res_dir, "eda/")
+  mlm_dir <- paste0(res_dir,"mixed_effects_models/")
+  
+} else {
+  
+  # Directories
+  scripts_dir <- paste0(getwd(), "/")
+  main_dir <- paste0(scripts_dir, "../")
+  data_dir <- paste0(main_dir, "01_data/")
+  res_dir <- paste0(main_dir, "03_results/", 
+                    ifelse(mixed_is_formula,
+                           "mixed_formula_combined/",
+                           "feeding_separate/"))
+  eda_dir <- paste0(res_dir, "eda/")
+  mlm_dir <- paste0(res_dir, "mixed_effects_models/")
+  
+}
+
+# Make directories
+for (directory in c(scripts_dir, res_dir, eda_dir, mlm_dir)) { dir.create(directory, recursive = TRUE, showWarnings=FALSE) }
+
+```
+
+### Source extra functions
+
+```{r}
+
+# Source script with extra functions in
+source(paste0(scripts_dir, "extra_functions.R"))
+
+```
+
+#### Read in data
+
+```{r}
+
+# Read in data
+all_data <- read.csv(paste0(data_dir,"all_data.combined_mbiome_metadata.tsv"), sep="\t", header=TRUE)
+metadata <- read.csv(paste0(data_dir,"sample_metadata.tsv"), sep="\t", header=TRUE)
+tall.mbiome_data <- read.table(paste0(data_dir,"microbiome_cfus_data.tall_format.zero_cfu_orgs_removed.tsv"), sep="\t", header=TRUE)
+
+# Read in organisms detected (CFU > 0) in any sample
+nonzero.sum_cfu <- readRDS(paste0(main_dir, "03_results/undetected_organisms.rds")) 
+table(all_data$FEEDING)
+
+```
+
+#### Define organisms of interest
+
+These are those detected with considerable counts in most samples
+
+```{r}
+
+# Define organisms of interest
+orgs_of_interest <- c("Total_count_of_Escherichia_coli", "conditionally_pathogenic_microflora", "lactobacteria", "bifidobacteria")
+
+```
+
+#### Scale data
+
+```{r}
+
+# Scale data at sample level
+all_data["Z_CALPROTECTINE"] <- scale(all_data$calprotectine, center=TRUE, scale=TRUE)
+
+```
+
+#### Scale data at the organism-wise level
+
+```{r}
+
+# Add scaled covariates
+tall.mbiome_data["Z_SQRT_CALPROTECTINE"] <- tall.mbiome_data$CALPROTECTINE 
+tall.mbiome_data["Z_CALPROTECTINE"] <- tall.mbiome_data$CALPROTECTINE 
+tall.mbiome_data["Z_CFU"] <- tall.mbiome_data$CFU 
+
+# Loop over organisms and scale
+for (org in orgs_of_interest) {
+  
+  # Scale
+  tall.mbiome_data[tall.mbiome_data$ORGANISM == org,]["Z_SQRT_CALPROTECTINE"] <-  scale(sqrt(tall.mbiome_data[tall.mbiome_data$ORGANISM == org,]$CALPROTECTINE), center=TRUE, scale=TRUE)
+  tall.mbiome_data[tall.mbiome_data$ORGANISM == org,]["Z_CALPROTECTINE"] <-  scale(tall.mbiome_data[tall.mbiome_data$ORGANISM == org,]$CALPROTECTINE, center=TRUE, scale=TRUE)
+  tall.mbiome_data[tall.mbiome_data$ORGANISM == org,]["Z_CFU"] <-  scale(tall.mbiome_data[tall.mbiome_data$ORGANISM == org,]$CFU, center=TRUE, scale=TRUE)
+
+}
+
+# Scale Sqrt Calprotectin
+all_data["Z_SQRT_CALPROTECTINE"] <- scale(sqrt(all_data$calprotectine), center=TRUE, scale=TRUE)
+
+```
+
+#### Scale additional covariates
+
+```{r}
+
+# Scale covariates
+all_data["Z_STOOL_NUMBER"] <- scale(all_data$stool_amount, center=TRUE, scale=TRUE)
+all_data["Z_BIRTHWEIGHT"] <- scale(all_data$Birthweight, center=TRUE, scale=TRUE)
+all_data["Z_MOM_AGE"] <- scale(all_data$Mother.s.age, center=TRUE, scale=TRUE)
+all_data["Z_WEEKS"] <- scale(as.numeric(gsub("_week","",all_data$Weeks)), center=TRUE, scale=TRUE)
+
+# Scale organisms 
+all_data["Z_ECOLI"] <- scale(all_data$Total_count_of_Escherichia_coli, center=TRUE, scale=TRUE)
+all_data["Z_LACTO"] <- scale(all_data$lactobacteria, center=TRUE, scale=TRUE)
+all_data["Z_BIFID"] <- scale(all_data$bifidobacteria, center=TRUE, scale=TRUE)
+all_data["Z_CONDI"] <- scale(all_data$conditionally_pathogenic_microflora, center=TRUE, scale=TRUE)
+
+```
+
+#### Make apgar categorical 
+
+This is because it appears mostly categorical
+
+```{r}
+
+# Histogram
+hist(all_data[!duplicated(all_data$PATIENT_ID),]$Apgar.1, breaks=10)
+hist(all_data[!duplicated(all_data$PATIENT_ID),]$Apgar.5, breaks=10)
+
+# Make categorical
+all_data$Fct_Apgar_1 <- as.factor(as.character(all_data$Apgar.1))
+all_data$Fct_Apgar_5 <- as.factor(as.character(all_data$Apgar.5))
+all_data["Z_APGAR_1"] <- scale(all_data$Apgar.1, center=TRUE, scale=TRUE)
+all_data["Z_APGAR_5"] <- scale(all_data$Apgar.5, center=TRUE, scale=TRUE)
+
+```
+
+#### Format data for mlm'ing
+
+```{r}
+
+# Get in format for mlm'ingmcx 21`12 M \
+for_mlm.data <- merge(all_data[,!colnames(all_data) %in% c("PATIENT_ID","Z_CALPROTECTINE","Z_SQRT_CALPROTECTINE",unique(tall.mbiome_data$ORGANISM))], tall.mbiome_data, by="SAMPLE_ID")
+
+# Make patient character
+for_mlm.data["PATIENT_ID"] <- paste0("id_",for_mlm.data$PATIENT_ID)
+
+```
+
+### Colours
+
+```{r}
+
+# Get organism colours
+org_colors <- hue_pal()(5)
+names(org_colors) <- names(nonzero.sum_cfu)
+
+# Weeks
+week_colors <- c("#FEE391", "#EC7014", "#662506"); names(week_colors) <- unique(all_data$Weeks)
+sig.week_colors <- c(week_colors,"NS"="darkgrey")
+
+```
+
+### Mixed effects models
+
+Based on:
+* PDF on mixed models in meetings and notes
+* Random effect estimation and correlation parameter: https://rpubs.com/yjunechoe/correlationsLMEM
+
+Random effects estimation (in this case with random intercept and random slope) involves the estimation of 3 parameters:
+
+* Variation of the random intercepts.
+* Variation of the random slopes.
+* Correlation between intercepts and slopes.
+
+These paramters define a *bivariate* normal distribution over subject intercept and slopes. 
+
+Note that by estimating the 3rd paramter, correlation, we limit the degrees of freedom further meaning we risk overfitting/poor fits. So in some circumstances can do without it (see https://rpubs.com/yjunechoe/correlationsLMEM).
+
+One recommended method for fitting models is:
+
+* Forward-testing random effects: Add random effects one by one and compare models.
+* Back-testing fixed effects: Compare models by dropping least significant terms.
+
+Note that REML can only be used when comparing models with the same fixed-effects structures. Issue is that without REML it's difficult to fit the models.
+
+Getting no issues with model convergence for all species except "bifidobacteria". This is with and without REML and with and without the optimx, L-BFGS-B method.
+
+#### Patient as random intercept, test APGAR
+
+# Define p-value
+bonf_pval <- 0.05 / 2
+
+# INitialise empty output dataframe
+all.apgar.mixed.lmer <- data.frame()
+
+# Beautify variable names
+all_data <- all_data[,!grepl("calprotectine|^Calprotectine|Weeks|Birthweight|Feeding",colnames(all_data))]
+colnames(all_data) <- str_to_title(tolower(mgsub(colnames(all_data),c("Z_","Z ","CTINE$","SQRT_"), c("","","CTIN","SQRT_"))))
+all_data$Patient_id <- as.character(all_data$Patient_id)
+ 
+# Loop over Apgar 1 and 5, including each in separate models
+for (apgar in c("Z_APGAR_1","Z_APGAR_5")) {
+  
+  # For all data combined (subset to keep just bifidobacteria, just deduplicates the week/patient-level measurements)
+  apgar.mixed.lmer <- lmer(as.formula(paste0("Sqrt_calprotectine ~ ",apgar," + Weeks + Gender + Birthweight + Feeding + (1|Patient_id)")), 
+                           data = all_data, REML=TRUE, na.action = na.exclude)
+  print(summary(apgar.mixed.lmer))
+  
+  # Plot QC metrics
+  print(plot(apgar.mixed.lmer))
+  qqnorm(resid(apgar.mixed.lmer))
+  qqline(resid(apgar.mixed.lmer)) 
+  
+  # Plot model (fixed effects)
+  fe_plt <- plot_model(apgar.mixed.lmer, type = "est", show.values = TRUE, 
+                       ci.lvl=1-bonf_pval, 
+                       p.threshold=bonf_pval,
+                       vline.color="darkgrey") + 
+    theme(axis.text=element_text(size=24),
+          axis.title=element_text(size=36)) +
+    theme_bw()
+  
+  # Plot model (random effects)
+  re_plt <- plot_model(apgar.mixed.lmer, type = "re", 
+                       ci.lvl=1-bonf_pval,
+                       p.threshold=bonf_pval,
+                       vline.color="darkgrey") + 
+    theme(axis.text=element_text(size=24),
+          axis.title=element_text(size=36)) +
+    theme_bw()
+  
+  # Save random effects model
+  dir.create(paste0(mlm_dir,"/by_apgar/"))
+  ggsave(paste0(mlm_dir,"/by_apgar/",apgar,".fixeff_coefficients.dwplt.jpeg"), fe_plt, units="px", width=2500, height=1000)
+  ggsave(paste0(mlm_dir,"/by_apgar/",apgar,".randeff_coefficients.dwplt.jpeg"), re_plt, units="px", width=2000, height=4000)
+  
+  # Get dataframe
+  apgar.mixed.lmer.df <- data.frame(broom.mixed::tidy(apgar.mixed.lmer, conf.int=TRUE, conf.level=(1 - bonf_pval)), GROUP=apgar)
+  apgar.mixed.lmer.df <- apgar.mixed.lmer.df[!is.na(apgar.mixed.lmer.df$std.error),]
+  
+  # Add apgar
+  apgar.mixed.lmer.df["model"] <- apgar
+  
+  # Add to larger dataframe
+  all.apgar.mixed.lmer <- rbind(all.apgar.mixed.lmer, apgar.mixed.lmer.df)
+  
+}
+  
+table(all.apgar.mixed.lmer$model)
+
+# Define plot colours
+plot_colors <- c("darkred", "NS"="darkgrey", "Week: 2"="black", "Week: 3"="black", "Week: 5"="black")
+names(plot_colors)[[1]] <- paste0("p < ",round(bonf_pval,4))
+  
+# Sort term and facetting names
+all.apgar.mixed.lmer$term <- mgsub(all.apgar.mixed.lmer$term, c("FEEDING","Z_BIRTHWEIGHT","Gender","Z_WEEKS","Z_Apgar"), c("","Birthweight","","Weeks","Apgar "))
+all.apgar.mixed.lmer$model <- gsub("Z_Apgar","Apgar ",all.apgar.mixed.lmer$model)  
+
+# Plot
+DWPlot(all.apgar.mixed.lmer, pval=bonf_pval,
+       plot_colors=plot_colors, filename=paste0(mlm_dir,"apgars.random_effects_model.calprot_by_patient.effect_size.dw_plots.jpeg"))
+
+#### Patient as random intercept, all organisms included
+
+```{r}
+
+# Define p-value
+bonf_pval <- 0.05
+
+# Relevel delivery
+all_data$Delivery <- factor(all_data$Delivery, levels=c("n","cs"))
+
+# Run model
+org.mixed.lmer <- lmer(as.formula(paste0("Z_SQRT_CALPROTECTINE ~ Z_BIRTHWEIGHT + Z_WEEKS + Gender + Delivery + FEEDING + Z_ECOLI + Z_CONDI + Z_LACTO + Z_BIFID + (1|PATIENT_ID)")), 
+                       data = all_data, na.action = na.exclude)
+print(summary(org.mixed.lmer))
+
+# Plot QC metrics
+print(plot(org.mixed.lmer))
+qqnorm(resid(org.mixed.lmer))
+qqline(resid(org.mixed.lmer)) 
+
+# Convert axis labels
+axisMappings <- c("Birthweight","Weeks","Gender [m]","Delivery [cs]","Feeding [Formula]","E. coli","Opp. Pathogens","Lactobacteria","Bifidobacteria")
+names(axisMappings) <- colnames(coef(org.mixed.lmer)$PATIENT_ID)[-1]
+  
+# Plot model (fixed effects)
+fe_plt <- plot_model(org.mixed.lmer, type = "est", show.values = TRUE, 
+                     ci.lvl=1-bonf_pval, 
+                     p.threshold=bonf_pval,
+                     show.p=TRUE,
+                     value.size=7,
+                     value.offset=0.3,
+                     dot.size=1,
+                     vline.color="darkgrey") + 
+    ggtitle("") +
+    scale_x_discrete(labels=axisMappings) + 
+    theme(axis.text.y=element_text(size=48),
+          axis.title=element_text(size=72)) +
+    theme_bw()
+  
+# Plot model (random effects)
+re_plt <- plot_model(org.mixed.lmer, type = "re", 
+                     ci.lvl=1-bonf_pval,
+                     show.p=TRUE,
+                     value.size=4.5,
+                     dot.size=1,
+                     value.offset = 0.3,
+                     vline.color="darkgrey") + 
+    ggtitle("") +
+    theme_bw()
+
+fe_plt$theme$axis.text$size <- 20
+fe_plt$theme$axis.text.y$size <- 24
+fe_plt$theme$axis.title.x$size <- 36
+
+# Save random effects model
+dir.create(paste0(mlm_dir,"/all_organisms_in_model/"))
+ggsave(paste0(mlm_dir,"/all_organisms_in_model/all_organisms_in_model.fixeff_coefficients.dwplt.jpeg"), fe_plt, units="px", width=3000, height=2000)
+ggsave(paste0(mlm_dir,"/all_organisms_in_model/all_organisms_in_model.randeff_coefficients.dwplt.jpeg"), re_plt, units="px", width=2000, height=4000)
+ 
+# Get dataframe
+org.mixed.lmer.df <- data.frame(broom.mixed::tidy(org.mixed.lmer, conf.int=TRUE, conf.level=(1 - bonf_pval)), GROUP="")
+org.mixed.lmer.df <- org.mixed.lmer.df[!is.na(org.mixed.lmer.df$std.error),]
+org.mixed.lmer.df <- data.frame(model="All\nOrganisms",org.mixed.lmer.df)
+
+# Save table
+org.mixed.lmer.df$model <- gsub("\n"," ",org.mixed.lmer.df$model)
+write.table(rename(org.mixed.lmer.df[,c("model","term","estimate","std.error","statistic","df","p.value","conf.low","conf.high")],
+                   c("Organism"="model")),
+            paste0(mlm_dir,"/all_organisms_in_model/calprotectineAsResponse_allOrganismsIncluded_lmmModelResults.tsv"), quote=FALSE, sep="\t", row.names=FALSE)
+
+```
+
+#### Patient as random variable, per CFU
+
+Fit only random intercept (as random slopes tend to not result in convergence).
+
+# Define bonferonni-adjusted p-value
+bonf_pval <- (0.05/length(orgs_of_interest))
+
+# Defined desired model formula
+model_formula <- "Z_SQRT_CALPROTECTINE ~ Z_CFU + Z_WEEKS + Gender + Delivery + Z_BIRTHWEIGHT + FEEDING + (1|PATIENT_ID)"
+for_mlm.data["Weeks"] <- as.numeric(gsub("_week","",for_mlm.data$Weeks))
+
+# Define list of all models
+all.org_models <- list()
+all.org_models.df <- data.frame()
+
+# Loop over and fit models per organism
+for (org in orgs_of_interest) {
+
+  # For all data combined
+  print(paste0("########## ORGANISM: ",org))
+  mixed.lmer <- lmer(as.formula(model_formula), data = for_mlm.data[for_mlm.data$ORGANISM == org,], REML=TRUE, na.action = na.exclude)
+  print(summary(mixed.lmer))
+  
+  # Plot QC metrics
+  print(plot(mixed.lmer))
+  qqnorm(resid(mixed.lmer))
+  qqline(resid(mixed.lmer)) 
+  
+  # Plot model (fixed effects)
+  fe_plt <- plot_model(mixed.lmer, type = "est", show.values = TRUE, 
+                       ci.lvl=1-bonf_pval, 
+                       p.threshold=bonf_pval,
+                       vline.color="darkgrey") + 
+    theme(axis.text=element_text(size=24),
+          axis.title=element_text(size=36)) +
+    theme_bw()
+  
+  # Plot model (random effects)
+  re_plt <- plot_model(mixed.lmer, type = "re", 
+                       ci.lvl=1-bonf_pval,
+                       p.threshold=bonf_pval,
+                       vline.color="darkgrey") + 
+    theme(axis.text=element_text(size=24),
+          axis.title=element_text(size=36)) +
+    theme_bw()
+  
+  # Save random effects model
+  dir.create(paste0(mlm_dir,"/by_organism/"))
+  ggsave(paste0(mlm_dir,"/by_organism/",org,".fixeff_coefficients.dwplt.jpeg"), fe_plt, units="px", width=2500, height=1000)
+  ggsave(paste0(mlm_dir,"/by_organism/",org,".randeff_coefficients.dwplt.jpeg"), re_plt, units="px", width=2000, height=4000)
+  
+  # Add to list
+  all.org_models <- list.append(all.org_models, mixed.lmer)
+  all.org_models.df <- rbind(all.org_models.df, data.frame(model=org, broom.mixed::tidy(mixed.lmer, conf.int = TRUE, conf.level=1 - bonf_pval)))
+  
+}
+
+# Add species as model names
+names(all.org_models) <- orgs_of_interest
+
+# Remove NA
+all.org_models.df <- all.org_models.df[!is.na(all.org_models.df$std.error),]
+
+# Define plot colours
+plot_colors <- c("darkred", "NS"="darkgrey", "Week: 2"="black", "Week: 3"="black", "Week: 5"="black")
+names(plot_colors)[[1]] <- paste0("p < ",round(bonf_pval,4))
+  
+# Sort term and facetting names
+all.org_models.df$term <- mgsub(all.org_models.df$term, c("FEEDING","Z_BIRTHWEIGHT","Gender","Z_WEEKS","Z_Apgar","Z_CFU"), c("","Birthweight","","Weeks","Apgar ","CFU"))
+all.org_models.df$model <- mgsub(all.org_models.df$model, c("bifidobacteria","lactobacteria","Total_count_of_Escherichia_coli","conditionally_pathogenic_microflora"), 
+                                                         c("Bifidobacteria","Lactobacteria","Total E. coli", "Conditionally\npathogenic\nmicroflora"))
+
+#### Patient as random variable, CFU as output
+
+Fit only random intercept (as random slopes tend to not result in convergence).
+
+```{r}
+
+# Define bonferonni-adjusted p-value
+bonf_pval <- (0.05/length(orgs_of_interest))
+
+# Define list of all models
+all.org_models <- list()
+all.org_models.df <- data.frame()
+
+# Plot titles
+plotTitles <- c("B","C","D","E")
+names(plotTitles) <- orgs_of_interest
+
+# Define combined plot
+multiPltList <- list()
+
+# Loop over and fit models per organism
+for (org in orgs_of_interest) {
+  
+  # Subset organism
+  orgData <- for_mlm.data[for_mlm.data$ORGANISM == org,!grepl("Z_CFU|Z_WEEKS|Z_BIRTHWEIGHT",colnames(for_mlm.data))]
+
+  # Relevel delivery
+  orgData$Delivery <- factor(orgData$Delivery, levels=c("n","cs"))
+
+  # Scale
+  orgData["CFU"] <- scale(orgData$CFU, center=TRUE, scale=TRUE)
+  orgData["Weeks"] <- scale(orgData$WEEKS, center=TRUE, scale=TRUE)
+  orgData["Birthweight"] <- scale(orgData$Birthweight, center=TRUE, scale=TRUE)
+  
+  # Fix variable names
+  colnames(orgData) <- gsub("FEEDING","Feeding",colnames(orgData))
+  
+  # Defined desired model formula
+  model_formula <- "CFU ~ Weeks + Gender + Delivery + Birthweight + Feeding + (1|PATIENT_ID)"
+  for_mlm.data["Weeks"] <- as.numeric(gsub("_week","",for_mlm.data$Weeks))
+
+  # For all data combined
+  print(paste0("########## ORGANISM: ",org))
+  mixed.lmer <- lmer(as.formula(model_formula), data = orgData, REML=TRUE, na.action = na.exclude)
+  print(summary(mixed.lmer))
+  
+  # Plot QC metrics
+  print(plot(mixed.lmer))
+  qqnorm(resid(mixed.lmer))
+  qqline(resid(mixed.lmer))
+  
+  # Tidy opportunistic pathogens
+  if (grepl("conditional",org)) { org <- "Opp. Pathogen" }
+  if (grepl("Total",org)) { org <- "Total E. coli" }
+  
+  # Plot model (fixed effects)
+  fe_plt <- plot_model(mixed.lmer, type = "est",
+                       ci.lvl=1-bonf_pval, 
+                       show.values = TRUE,
+                       value.size = 6,
+                       value.offset=0.3,
+                       p.threshold=bonf_pval,
+                       vline.color="darkgrey") + 
+    theme(axis.text=element_text(size=36),
+          axis.title=element_text(size=42)) +
+    ggtitle(gsub("_"," ",str_to_title(org))) +
+    theme_bw()
+  
+  # Plot model (random effects)
+  re_plt <- plot_model(mixed.lmer, type = "re", 
+                       ci.lvl=1-bonf_pval,
+                       show.values = TRUE,
+                       value.size = 4,
+                       p.threshold=bonf_pval,
+                       vline.color="darkgrey") + 
+    theme(axis.text=element_text(size=36),
+          axis.title=element_text(size=42)) +
+    ggtitle(gsub("_"," ",str_to_title(org))) +
+    theme_bw()
+
+  fe_plt$theme$axis.text$size <- 18
+  fe_plt$theme$axis.title.x$size <- 20
+  fe_plt$theme$plot.title$size <- 24
+  
+  # Save random effects model
+  dir.create(paste0(mlm_dir,"/by_organism/organismAsResponse/"))
+  ggsave(paste0(mlm_dir,"/by_organism/organismAsResponse/",org,"_regressedOntoCFU.fixeff_coefficients.dwplt.jpeg"), fe_plt, units="px", width=1500, height=1250)
+  ggsave(paste0(mlm_dir,"/by_organism/organismAsResponse/",org,"_regressedOntoCFU.randeff_coefficients.dwplt.jpeg"), re_plt, units="px", width=2000, height=4000)
+  
+  # Add to list
+  all.org_models <- list.append(all.org_models, mixed.lmer)
+  all.org_models.df <- rbind(all.org_models.df, data.frame(model=org, broom.mixed::tidy(mixed.lmer, conf.int = TRUE, conf.level=1 - bonf_pval)))
+  
+  # add to multi plot
+  multiPltList <- rlist::list.append(multiPltList, fe_plt)
+  
+}
+
+
+
+# Add species as model names
+names(all.org_models) <- orgs_of_interest
+
+# Remove NA
+all.org_models.df <- all.org_models.df[!is.na(all.org_models.df$std.error),]
+
+# Define plot colours
+plot_colors <- c("darkred", "NS"="darkgrey", "Week: 2"="black", "Week: 3"="black", "Week: 5"="black")
+names(plot_colors)[[1]] <- paste0("p < ",round(bonf_pval,4))
+  
+# Sort term and facetting names
+all.org_models.df$term <- mgsub(all.org_models.df$term, c("FEEDING","Z_BIRTHWEIGHT","Gender","Z_WEEKS","Z_Apgar","Z_CFU"), c("","Birthweight","","Weeks","Apgar ","CFU"))
+all.org_models.df$model <- mgsub(all.org_models.df$model, c("bifidobacteria","lactobacteria","Total_count_of_Escherichia_coli","conditionally_pathogenic_microflora"), 
+                                                         c("Bifidobacteria","Lactobacteria","Total E. coli", "Conditionally\npathogenic\nmicroflora"))
+
+# Save combined plot
+ggsave(paste0(mlm_dir,"/by_organism/organismAsResponse/allOrganisms_regressedOntoCFU.randeff_coefficients.dwplt.jpeg"),
+       patchwork::wrap_plots(multiPltList, nrow=2, ncol=2), width=3000, height=2500, units="px")
+
+# Save table
+write.table(rename(all.org_models.df[,c("model","term","estimate","std.error","statistic","df","p.value","conf.low","conf.high")],
+            c("Organism"="model")),
+            paste0(mlm_dir,"/by_organism/organismAsResponse/perOrganismCFU_asResponse_lmmModelResults.tsv"), quote=FALSE, sep="\t", row.names=FALSE)
+
+```
+
+#### Plot trends
+
+Most code for plotting adapted from: https://ourcodingclub.github.io/tutorials/mixed-models/
+
+##### Global (fixed) trends
+
+```{r}
+
+# Plot calprotectin (non-log)
+for (org in orgs_of_interest) {
+  
+  print(org)
+  
+  # Get predicted data and plot
+  pred_df <- ggpredict(all.org_models[[org]], terms="Z_CFU")
+  pred_df$x <- ( pred_df$x * sd(for_mlm.data$CFU, na.rm=TRUE) ) + mean(for_mlm.data$CFU, na.rm=TRUE)
+  pred_df$predicted <- ( pred_df$predicted * sd(for_mlm.data$CALPROTECTINE, na.rm=TRUE) ) + mean(for_mlm.data$CALPROTECTINE, na.rm=TRUE)
+  
+  # Plot trend lines
+  plt <- ggplot(pred_df) +
+     geom_line(aes(x = x, y = predicted)) +          # slope
+     geom_ribbon(aes(x = x, ymin = conf.low, ymax = conf.high), 
+                 fill = "lightgrey", alpha = 0.5) +  # error band
+     geom_point(data=for_mlm.data[for_mlm.data$ORGANISM == org,], aes(x=CFU, y=CALPROTECTINE, fill=as.factor(PATIENT_ID)), shape=21, size=4, alpha=0.65) +
+     scale_colour_manual(values=hue_pal()(length(unique(for_mlm.data$PATIENT_ID)))) +
+     labs(title=paste0("Global trend of Calprotectin with increased CFU:\n",gsub("_"," ",org)), x = "CFU", y="Calprotectin") +
+     theme_bw(base_size=20) + theme(axis.title=element_text(size=30),
+                                    plot.title= element_text(size=36),
+                                    legend.position="none")
+  
+  # Save
+  ggsave(paste0(mlm_dir,org,".global_trendlines.mixed_lm_model.calprot_vs_cfu.jpeg"), plt, units="px", width=4000, height=4000)
+  
+}
+
+```
+
+##### Random (patient-wise) trends
+
+```{r}
+
+# Plot calprotectin (non-log)
+for (org in orgs_of_interest) {
+  
+  print(org)
+  
+  # Get predicted data and plot
+  pred_df <- data.frame(ggpredict(all.org_models[[org]], terms=c("Z_CFU","PATIENT_ID"), type = "re"))
+  colnames(pred_df)[[6]] <- "PATIENT_ID"
+  
+  # Un-scaled CFU
+  pred_df$x <- ( pred_df$x * sd(for_mlm.data$CFU, na.rm=TRUE) ) + mean(for_mlm.data$CFU, na.rm=TRUE)
+  pred_df$predicted <- ( pred_df$predicted * sd(for_mlm.data$CALPROTECTINE, na.rm=TRUE) ) + mean(for_mlm.data$CALPROTECTINE, na.rm=TRUE)
+  pred_df$conf.high <- ( pred_df$conf.high * sd(for_mlm.data$CFU, na.rm=TRUE) ) + mean(for_mlm.data$CFU, na.rm=TRUE)
+  pred_df$conf.low <- ( pred_df$conf.low * sd(for_mlm.data$CFU, na.rm=TRUE) ) + mean(for_mlm.data$CFU, na.rm=TRUE)
+  
+  # Plot nicely
+  plt <- ggplot(data=for_mlm.data[for_mlm.data$ORGANISM == org,]) +
+      geom_point(mapping=aes(x=CFU, y=CALPROTECTINE, fill=as.factor(PATIENT_ID)), shape=21, size=2, alpha=0.65) +
+      facet_wrap(~ PATIENT_ID, ncol=8) +
+      geom_line(data=pred_df, aes(x = x, y = predicted, color=PATIENT_ID)) +
+      scale_colour_manual(values=hue_pal()(length(unique(for_mlm.data$PATIENT_ID)))) +
+      labs(title=paste0("Patient-wise trend of Calprotectin with increased CFU:\n",gsub("_"," ",org)), x = "CFU", y="Calprotectin") +
+      theme_bw(base_size=16) + theme(axis.title=element_text(size=24),
+                                    plot.title= element_text(size=28),
+                                    legend.position="none")
+  
+  # Save
+  ggsave(paste0(mlm_dir,org,".patientwise_trendlines.mixed_lm_model.calprot_vs_cfu.jpeg"), plt, units="px", width=4000, height=3000)
+  
+}
+
+```
+
+

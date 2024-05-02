@@ -1,0 +1,6 @@
+{
+  "datamanip"  : ["tidytable","readxl","rlist","broom","mgsub","rlist"],
+  "filemanip"  : ["here"],
+  "plotting"   : ["ggplot2","ComplexHeatmap","patchwork","cowplot","dotwhisker","scales","colorspace","ggpubr","stringr","sjPlot","ggeffects","ggbeeswarm","patchwork"],
+  "stats"      : ["vegan","lme4","lmerTest"]
+}

@@ -1,0 +1,879 @@
+---
+title: "S. Popov Faecal Bacteria: EDA"
+author: "Euan McDonnell"
+date: "2023-07-03"
+output: html_document
+---
+
+
+## Tasks
+
+### To ask
+
+* Some numbers in dad's age not arabic numerals
+* What do offset date of birth mean, must be wrong with 1901.
+
+### To Do
+
+* Check correlations between variables, esp body size measurements and weight.
+* Calculate CFUs as proportion of total CFUs per patient.
+
+
+## Code
+
+### Remove
+
+```{r}
+
+rm(list=ls(all.names=T)); gc()
+
+```
+
+### Libraries
+
+```{r}
+
+# Run script to get and install libraries
+source("get_libraries.R")
+
+# Get required packages that can be installed normally
+lib_list <- GetLibsFromJSON(path_name="package_dependencies/", dependencies=TRUE)
+
+```
+
+### Parameters
+
+```{r}
+
+# Toggle to drop outliers idenitifed via NMDS
+drop_outliers <- FALSE
+mixed_is_formula <- TRUE
+
+```
+
+### Define directories
+
+```{r}
+
+# Define directories with outliers removed
+scripts_dir <- paste0(getwd(), "/")
+main_dir <- paste0(scripts_dir, "../")
+data_dir <- paste0(main_dir, "01_data/")
+res_dir <- paste0(main_dir, "03_results/", 
+                  ifelse(mixed_is_formula,
+                         "mixed_formula_combined/",
+                         "feeding_separate/"))
+eda_dir <- paste0(res_dir, "eda/")
+
+# Add if treating formula as combined/mixed
+# if (mixed_is_formula) { feed_dir <- paste0(eda_dir, "formula_combined_with_mixed/") } else { feed_dir <- eda_dir }
+
+# Make directories
+for (directory in c(scripts_dir, res_dir, eda_dir, paste0(eda_dir, "cfus/"))) { dir.create(directory, recursive = TRUE, showWarnings=FALSE) }
+
+```
+
+### Source extra functions
+
+```{r}
+
+# Source script with extra functions in
+source(paste0(scripts_dir, "extra_functions.R"))
+
+```
+
+### Read in data
+
+```{r}
+
+# Read in metadata
+metadata <- read_xlsx(paste0(data_dir,"Copy of AP 2023-06-20 200623 MT B.tall_format.xlsx"), sheet=1); colnames(metadata)[[1]] <- "PATIENT_ID"
+metadata <- metadata[!is.na(metadata$PATIENT_ID),]
+
+# Read in sample data
+mbiome_data <- read_xlsx(paste0(data_dir,"Copy of AP 2023-06-20 200623 MT B.tall_format.xlsx"), sheet=2)
+calprot_data <- read_xlsx(paste0(data_dir,"Copy of AP 2023-06-20 200623 MT B.tall_format.xlsx"), sheet=3)
+
+```
+
+### Fix variables
+
+```{r}
+
+# Fix data
+metadata["mom's profesion"] <- ifelse(metadata$`mom's profesion` == "don't work", "don't work", "works")
+metadata["stool_consistency"] <- gsub(",.*","",metadata$Stool)
+metadata["stool_amount"] <- as.numeric(mgsub::mgsub(metadata$Stool, c(".*, ", " times.*"),c("","")))
+
+# Toggle if treating mixed and formula as the same
+if (mixed_is_formula) {
+  
+  # Set levels
+  metadata["FEEDING"] <- "Breast"
+  metadata[metadata$`Formula feeding` == "+" | metadata$`Mixt feeding` == "+",]["FEEDING"] <- "Formula"
+ 
+# Else treat as separate
+} else {
+  
+  # Set levels
+  metadata["FEEDING"] <- "Breast"
+  metadata[metadata$`Formula feeding` == "+" ,]["FEEDING"] <- "Formula"
+  metadata[metadata$`Mixt feeding` == "+",]["FEEDING"] <- "Mixed"
+  
+}
+  
+# Remove pulmicort
+metadata[grepl("pulm",metadata$`Treatment during pregnancy`),]["Treatment during pregnancy"] <- "multivitamins"
+
+```
+
+### Combine data
+
+```{r}
+
+# Remove space
+mbiome_data$Weeks <- gsub(" ","_",mbiome_data$Weeks)
+calprot_data$Weeks <- gsub(" ","_",calprot_data$Weeks)
+
+# Add patient ID code
+mbiome_data <- data.frame(SAMPLE_ID=paste(mbiome_data$Patient, mbiome_data$Weeks, sep="_"), mbiome_data)
+calprot_data <- data.frame(SAMPLE_ID=paste(calprot_data$Number, calprot_data$Weeks, sep="_"), calprot_data)
+
+# Edit awkward microbe names
+colnames(mbiome_data)[4:ncol(mbiome_data)] <- gsub("\n\n","_",gsub("[.]","_",colnames(mbiome_data)[4:ncol(mbiome_data)]))
+
+# Combine
+all_data <- merge(mbiome_data, calprot_data[,c("SAMPLE_ID","calprotectine")], by="SAMPLE_ID")
+all_data <- merge(metadata, all_data, by.x="PATIENT_ID", by.y="Patient")
+
+```
+
+### Get tall format
+
+```{r}
+
+# Make tall
+tall.mbiome_data <- reshape2::melt(all_data[,which(colnames(all_data) %in% c(colnames(mbiome_data),"calprotectine"))], id.vars=c("SAMPLE_ID", "Weeks","calprotectine"))
+colnames(tall.mbiome_data) <- c("SAMPLE_ID","WEEKS","CALPROTECTINE","ORGANISM","CFU")
+
+```
+
+### Update IDs etc
+
+```{r}
+
+# ADd dummy variable of patient ID organism
+tall.mbiome_data$ORGANISM <- as.character(tall.mbiome_data$ORGANISM)
+tall.mbiome_data["PATIENT_ORG"] <- paste(gsub("_.*","",tall.mbiome_data$SAMPLE_ID), tall.mbiome_data$ORGANISM, sep="_")
+
+# Add patient ID
+tall.mbiome_data["PATIENT_ID"] <- gsub("_.*","",tall.mbiome_data$SAMPLE_ID)
+
+# Make week continuous
+tall.mbiome_data["WEEKS"] <- as.numeric(gsub("_.*","",tall.mbiome_data$WEEKS))
+
+```
+
+### Total CFUs per patient
+
+```{r}
+
+# Add column totalling patient-wise CFU
+group_col <- "PATIENT_ID"
+tall.mbiome_data["CFU_TOTAL"] <- 0
+for (id in unique(tall.mbiome_data[[group_col]])) { 
+  
+  # Get total patient-wise CFU
+  total_cfu <- sum(tall.mbiome_data[tall.mbiome_data[[group_col]] == id,]$CFU)
+  
+  # View
+  print(paste(id, total_cfu, sep=": "))
+  
+  # Add for patient 
+  tall.mbiome_data[tall.mbiome_data[[group_col]] == id,]["CFU_TOTAL"] <- total_cfu
+  
+}
+
+# Visualise
+total_cfus <- tall.mbiome_data[!duplicated(tall.mbiome_data$PATIENT_ID),]$CFU_TOTAL
+names(total_cfus) <- unique(tall.mbiome_data$PATIENT_ID)
+hist(total_cfus)
+
+```
+
+### Define organisms of interest
+
+```{r}
+
+# Save dataset wiht all organisms
+write.table(all_data, paste0(data_dir,"all_data.combined_mbiome_metadata.tsv"), sep="\t", quote=FALSE)
+
+# Define organisms of interest
+orgs_of_interest <- c("Total_count_of_Escherichia_coli", "conditionally_pathogenic_microflora", "lactobacteria", "bifidobacteria")
+
+# Retain only organisms of interest
+tall.mbiome_data <- tall.mbiome_data[which(tall.mbiome_data$ORGANISM %in% orgs_of_interest),]
+
+```
+
+#### Adjust directories to look into "outliers removed" folder
+
+Sample IDs to be dropped are listed in a single-columned file called "samples2drop.tsv". These currently contain samples that appeared as "outliers" in the downstream NMDS, however this is subject to change and isn't the most reliable.
+
+```{r}
+
+# Toggle if we want to use the oulier excluded data
+if (drop_outliers) {
+  
+  # Read in outlier file
+  outlier_id.df <- read.table(paste0(data_dir,"samples2drop.tsv"), header=FALSE)
+  
+  # Define directories with outliers removed
+  data_dir <- paste0(data_dir, "outliers_removed/")
+  res_dir <- paste0(res_dir, "outliers_removed/")
+  
+  # Make directories
+  for (directory in c(res_dir, data_dir)) { dir.create(directory, recursive = FALSE, showWarnings=FALSE) }
+  
+  # Drop outliers in this file
+  all_data <- all_data[!all_data$SAMPLE_ID %in% outlier_id.df$V1,]
+  tall.mbiome_data <- tall.mbiome_data[!tall.mbiome_data$SAMPLE_ID %in% outlier_id.df$V1,]
+  
+  # Drop excluded patients
+  metadata <- metadata[metadata$PATIENT_ID %in% all_data$PATIENT_ID,]
+  
+}
+
+```
+
+### Birthweights by group
+
+```{r}
+
+# CFU vs organism
+boxplot(Birthweight ~ Gender, data = all_data)
+boxplot(Birthweight ~ `Treatment during pregnancy`, data = all_data)
+
+# Tests
+t.test(all_data[all_data$Gender == "m",]$Birthweight, all_data[all_data$Gender == "f",]$Birthweight)
+t.test(all_data[all_data$`Treatment during pregnancy`== "-",]$Birthweight, all_data[all_data$`Treatment during pregnancy` == "multivitamins",]$Birthweight)
+table(all_data$`Treatment during pregnancy`)
+
+```
+
+### Get undetected organisms
+
+```{r}
+
+# Get detected species
+orgwise.sum_cfu <- colSums(mbiome_data[,4:ncol(mbiome_data)]); names(orgwise.sum_cfu) <- colnames(mbiome_data[,4:ncol(mbiome_data)])
+nonzero.sum_cfu <- orgwise.sum_cfu[orgwise.sum_cfu > 0]
+
+# Save non-zero CFU organisms
+saveRDS(nonzero.sum_cfu, paste0(main_dir,"03_results/undetected_organisms.rds"))
+
+```
+
+### Colours
+
+```{r}
+
+# Get organism colours
+org_colors <- hue_pal()(5)
+names(org_colors) <- names(nonzero.sum_cfu)
+
+# Day
+week_colors <- c("#FEE391", "#EC7014", "#662506"); names(week_colors) <- unique(all_data$Weeks)
+
+```
+
+### NMDS 
+
+Based on: 
+
+* https://mb3is.megx.net/gustame/dissimilarity-based-methods/nmds
+* https://jkzorz.github.io/2019/06/06/NMDS.html
+
+Form of dimensional reduction. Features are:
+
+* Is non-parameteric and works on ranks so is good for often highly skewed microbiome data.
+* Takes as input a distance metric. Recommend Bray-Curtis as it accounts for presence/absence as well as abundance.
+* It is non-deterministic and so produces different results each time.
+ 
+Bray-curtis difference quantifies the difference in species populations between samples. Calculated as (where $i$, $j$ are two samples, $S_i$/$S_j$ is the total number of specimens in $i$/$j$, $C_{ij}$ is the lesser counts for each species found in both sites):
+ 
+$$BC_{ij} = 1 - \frac{2C_{ij}}{S_i + S_j}$$ 
+
+Stress is a measaure of goodness-of-fit for each iteration. Ideally should be less than 0.2. If it is 0, then you might have an outlier very difference from all samples. \textbf{Stress should be reported with the plot}.
+
+```{r}
+
+# Get matrix of species abundances
+for_nmds <- as.matrix(mbiome_data[,4:ncol(mbiome_data)])
+rownames(for_nmds) <- mbiome_data$SAMPLE_ID
+
+# Plot
+set.seed(777)
+nmds <- metaMDS(for_nmds, distance="bray")
+plot(nmds)
+
+# Get scores as output
+#extract NMDS scores (x and y coordinates) for sites from newer versions of vegan package
+data.scores = as.data.frame(vegan::scores(nmds)$sites)
+data.scores["SAMPLE_ID"] <- rownames(for_nmds)
+data.scores <- merge(mbiome_data, data.scores, by="SAMPLE_ID")
+
+# Plot
+xx <- ggplot(data.scores, aes(x = NMDS1, y = NMDS2, label=SAMPLE_ID)) + 
+             geom_label() +
+             theme_bw()
+
+ggsave(paste0(eda_dir,"nmds_plot.all_samples.jpeg"), xx, width=3000, height=3000, units="px")
+
+```
+
+### Drop possible outliers
+
+```{r}
+
+# Possible outliers
+outlier_samples <- c("3_3_week", "1_2_week", "5_5_week", "1_5_week", "3_5_week", 
+                     "5_3_week", "5_2_week", "3_2_week", "1_3_week")
+
+# Plot
+set.seed(777)
+sub.for_nmds <- for_nmds[!rownames(for_nmds) %in% outlier_samples,]
+nmds <- metaMDS(sub.for_nmds, distance="bray")
+plot(nmds)
+
+# Get scores as output
+#extract NMDS scores (x and y coordinates) for sites from newer versions of vegan package
+data.scores = as.data.frame(vegan::scores(nmds)$sites)
+data.scores["SAMPLE_ID"] <- rownames(sub.for_nmds)
+data.scores <- merge(mbiome_data, data.scores, by="SAMPLE_ID")
+
+# Add metadata
+data.scores <- merge(metadata, data.scores, by.x="PATIENT_ID", by.y="Patient")
+
+# Get week as just numbers (but as factors)
+data.scores["WEEKS"] <- as.factor(gsub("_.*","",data.scores$Weeks))
+
+# Function
+PlotNMDS <- function(in_data, point_size=8, color_by="FEEDING", shape_by="WEEKS") {
+  # Plot
+  plt <- ggplot(in_data[order(in_data$NMDS2),], 
+               aes(x = NMDS1, y = NMDS2, fill=.data[[color_by]], shape=.data[[shape_by]])) + 
+               geom_point(color="black", size=point_size, alpha=0.65) + scale_shape_manual(values=c(21,22,24)) +
+               theme_bw(base_size=16) + theme(legend.position="none",
+                                              axis.title=element_text(size=24))
+  
+  # Save
+  return(plt)
+  
+}
+
+sex_pal <- c("green", "darkorchid4")
+delivery_cols <- c("hotpink","lightblue")
+momprof_cols <- c("white","black")
+diag_cols <- c("salmon","yellow")
+treatpreg_cols <- c("mediumpurple","white")
+stoolconsistency_cols <- c("darkred","darkorange")
+
+# Plot
+dir.create(paste0(res_dir, "nmds"), recursive=TRUE)
+data.scores$PATIENT_ID <- as.factor(data.scores$PATIENT_ID)
+ggsave(paste0(eda_dir, "nmds/nmds_plot.outliers_removed.colbyfeeding.jpeg"), PlotNMDS(data.scores, color_by="FEEDING"), width=3000, height=3000, units="px")
+ggsave(paste0(eda_dir, "nmds/nmds_plot.outliers_removed.colbygender.jpeg"), PlotNMDS(data.scores, color_by="Gender") + scale_fill_manual(values=sex_pal), width=3000, height=3000, units="px")
+ggsave(paste0(eda_dir, "nmds/nmds_plot.outliers_removed.colbydelivery.jpeg"), PlotNMDS(data.scores, color_by="Delivery") + scale_fill_manual(values=delivery_cols), width=3000, height=3000, units="px")
+ggsave(paste0(eda_dir, "nmds/nmds_plot.outliers_removed.colbymomwork.jpeg"), PlotNMDS(data.scores, color_by="mom's profesion") + scale_fill_manual(values=momprof_cols), width=3000, height=3000, units="px")
+ggsave(paste0(eda_dir, "nmds/nmds_plot.outliers_removed.colbydiagnosis.jpeg"), PlotNMDS(data.scores, color_by="Diagnosis") + scale_fill_manual(values=diag_cols), width=3000, height=3000, units="px")
+ggsave(paste0(eda_dir, "nmds/nmds_plot.outliers_removed.colbypregtreatment.jpeg"), PlotNMDS(data.scores, color_by="Treatment during pregnancy") + scale_fill_manual(values=treatpreg_cols), width=3000, height=3000, units="px")
+ggsave(paste0(eda_dir, "nmds/nmds_plot.outliers_removed.colbystoolconsistency.jpeg"), PlotNMDS(data.scores, color_by="stool_consistency") + scale_fill_manual(values=stoolconsistency_cols), width=3000, height=3000, units="px")
+ggsave(paste0(eda_dir, "nmds/nmds_plot.outliers_removed.colbypatient_id.jpeg"), PlotNMDS(data.scores, color_by="PATIENT_ID"), width=3000, height=3000, units="px")
+
+```
+
+### PVCA
+
+Not feasible due to low number of features.
+
+# Sort out metadata
+cov_mod.formatted <- all_data[,c("PATIENT_ID","Gender", "Delivery", "mom's profesion", "Diagnosis", "Treatment during pregnancy", "Place of life", "stool_consistency", "stool_amount")]
+rownames(cov_mod.formatted) <- all_data$SAMPLE_ID
+cov_mod.formatted <- new("AnnotatedDataFrame", data = cov_mod.formatted)
+
+# Expressionset data
+rownames(mbiome_data) <- mbiome_data$SAMPLE_ID
+expr_unadj <- ExpressionSet(assayData = t(as.matrix(mbiome_data[rownames(cov_mod.formatted),4:ncol(mbiome_data)])), phenoData = cov_mod.formatted)
+
+# Run PVCA
+pvca_unadj <- pvcaBatchAssess(abatch = expr_unadj, batch.factors = colnames(cov_mod.formatted@data), threshold = varexpl_thr)
+
+# Assemble to df
+pvca_unadj.df <- data.frame(as.data.frame(pvca_unadj$label), t(as.data.frame(pvca_unadj$dat)), Method="Un-adjusted")
+colnames(pvca_unadj.df) <- c("Effect", "Variance", "Method")
+
+### Plot PVCA
+
+# Join
+pvca_df <- pvca_unadj.df
+pvca_df["Type"] <- "Single"
+pvca_df[grepl("[:]",pvca_df$Effect),]["Type"] <- "Int"
+
+# Remove duplicate raw
+pvca_df <- pvca_df[!duplicated(pvca_df[,c("Effect","Method")]),]
+
+# Define if raw/not raw
+pvca_df["Method_Group"] <- "Un-adjusted"
+
+# Visualise
+pvca_plt <- ggplot(pvca_df, aes(x=gsub("Z_","",Effect), y=Variance, fill=Method_Group)) + 
+  geom_bar(stat="identity", position="dodge") + scale_fill_manual(values=c(lighten("darkblue", 0.5))) +
+  facet_grid(cols=vars(Type), rows=vars(Method), space="free", scale="free") +
+  xlab("") + ylab("Variance") + ylim(0,0.6) +
+  theme_bw() + theme(axis.text.x=element_text(angle=90, hjust=1, vjust=0.5), legend.position = "top", legend.title=element_blank())
+
+# Save individaul
+ggsave(paste0(qc_dir,"pvca.barplot.jpeg"), pvca_plt, units="px", height=2000, width=2000)
+
+### Check detection of organisms
+
+```{r}
+
+# CFU vs organism
+boxplot(CFU ~ ORGANISM, data = tall.mbiome_data)
+lapply(unique(tall.mbiome_data$ORGANISM), function(org) {
+  print(paste0(org, ": ", sum(tall.mbiome_data[tall.mbiome_data$ORGANISM == org,]$CFU)))
+})
+
+# Calprotectine vs orgnaism
+boxplot(CALPROTECTINE ~ ORGANISM, data = tall.mbiome_data)
+lapply(unique(tall.mbiome_data$ORGANISM), function(org) {
+  print(paste0(org, ": ", sum(tall.mbiome_data[tall.mbiome_data$ORGANISM == org,]$CALPROTECTINE)))
+})
+
+# Get vector to change organism names
+org2plot <- list("Bifidobacteria","Lactobacteria","Total E. coli", "Opportunistic\nPathogens")
+names(org2plot) <- unique(tall.mbiome_data$ORGANISM)
+
+# Change facet labels
+changeLabels <- function(variable,value){
+  return(org2plot[value])
+}
+
+# GGplot
+plt <- ggplot(tall.mbiome_data, aes(x=as.character(WEEKS), y=CFU, group=WEEKS)) + 
+  geom_boxplot(fill="grey") + 
+  geom_beeswarm(color="black") +
+  facet_grid(rows=vars(ORGANISM), labeller=changeLabels) +
+  xlab("Weeks") + ylab("CFU") + 
+  theme_bw(base_size=28) + theme(legend.position="none",
+                                 strip.text.y=element_text(size=24, angle=0),
+                                 axis.text.x=element_text(size=36),
+                                 axis.title=element_text(size=42),
+                                 plot.title=element_text(size=72))
+
+# Save
+ggsave(paste0(eda_dir,"distribution_of_cfus.per_organism.jpeg"), plt, width=3000, height=3000, units="px")
+
+# Save above
+saveRDS(orgwise.sum_cfu,paste0(res_dir,"sum_cfus.all_species.rds"))
+saveRDS(nonzero.sum_cfu,paste0(res_dir,"sum_cfus.nonzero_species.rds"))
+
+```
+
+### Histograms
+
+```{r}
+
+hist(tall.mbiome_data$CALPROTECTINE)
+for (org in colnames(mbiome_data)[4:ncol(mbiome_data)]) { print(org); hist(mbiome_data[[org]]) }
+
+hist(all_data$calprotectine)
+mean(all_data$calprotectine)
+var(all_data$calprotectine)
+
+hist(metadata$`Apgar 1`)
+hist(metadata$`Apgar 5`)
+
+```
+
+### Organism CFU Correlations
+
+```{r}
+
+# Corelate organisms, CFU and calprotectine
+for (org in unique(tall.mbiome_data$ORGANISM)) { 
+  print(paste0(org, " : ", cor(tall.mbiome_data[tall.mbiome_data$ORGANISM == org,]$CFU, tall.mbiome_data[tall.mbiome_data$ORGANISM == org,]$CALPROTECTINE, method="spearman"))) 
+}
+for (org in unique(tall.mbiome_data$ORGANISM)) { 
+  print(paste0(org, " : ", cor(tall.mbiome_data[tall.mbiome_data$ORGANISM == org,]$CFU, tall.mbiome_data[tall.mbiome_data$ORGANISM == org,]$WEEKS, method="spearman"))) 
+}
+for (org in unique(tall.mbiome_data$ORGANISM)) { 
+  print(paste0(org, " : ", cor(tall.mbiome_data[tall.mbiome_data$ORGANISM == org,]$WEEKS, tall.mbiome_data[tall.mbiome_data$ORGANISM == org,]$CALPROTECTINE, method="spearman"))) 
+}
+
+# Loop over weeks
+for (week in unique(all_data$Weeks)) { 
+  
+  # Subset by week
+  week_df <- all_data[all_data$Weeks == week,]
+  
+  # Correlate day of start investivation and organism/calprotectine - This is important as older babies may bias towards more/less/different organisms
+  org_corr <- cor(week_df$`day of start investigation`, week_df[,c("bifidobacteria","lactobacteria","Total_count_of_Escherichia_coli","conditionally_pathogenic_microflora")]) 
+  calprot_corr <- cor(week_df$`day of start investigation`, week_df$calprotectine)
+  
+  # print
+  print(paste0("### Pearson's r: (Week ",week,") Offset day vs organism : ",paste(org_corr, collapse=", "), " // for bifidobacteria, lactobacteria, Total E.Coli, conditionally pathogenic")) 
+  print(paste0("### Pearson's r: (Week ",week,") Offset day vs calprotectin : ",calprot_corr))
+  
+}
+
+```
+
+### Correlate microbes CFUs pairwise, per week
+
+```{r}
+
+# Loop over weeks
+for (week in unique(all_data$Weeks)) { 
+
+  # Subset matrix  
+  print(week)
+  mbiome_m <- all_data[all_data$Weeks == week,colnames(mbiome_data)[4:ncol(mbiome_data)]]
+  colnames(mbiome_m) <- gsub("\n","_",colnames(mbiome_m))
+
+  # Keep only organisms of interest - Taken out the undetected 5
+  mbiome_m <- mbiome_m[,which(colnames(mbiome_m) %in% orgs_of_interest)]
+
+  # Get correlation matrix
+  corr_m <- cor(mbiome_m, method="pearson")  
+  bc_m <-  as.matrix(ecodist::bcdist(t(mbiome_m)))
+  colnames(corr_m) <- colnames(mbiome_m); rownames(corr_m) <- colnames(corr_m)
+  colnames(bc_m) <- colnames(mbiome_m); rownames(bc_m) <- colnames(bc_m)
+  
+  # Edit names
+  colnames(corr_m) <- mgsub::mgsub(colnames(corr_m), c("pathogenic_","of_","_"), c("pathogenic\n","of\n"," ")); rownames(corr_m) <- colnames(corr_m)
+  colnames(bc_m) <- mgsub::mgsub(colnames(bc_m), c("pathogenic_","of_","_"), c("pathogenic\n","of\n"," ")); rownames(bc_m) <- colnames(bc_m)
+  
+  # Plot
+  diag(corr_m) <- NA; diag(bc_m) <- NA
+  corr_hmap <- Heatmap(corr_m, 
+                       
+                # Colour scale       
+                col=circlize::colorRamp2(c(1,0,-1), c(lighten("red",0.25), "white", lighten("blue",0.25))),
+                
+                # Define cell contents
+                cell_fun = function(j, i, x, y, width, height, fill) {
+                  
+                  grid.text(sprintf("%.2f", corr_m[i, j]), x, y, gp = gpar(fontsize = 16))
+                    
+                },
+                heatmap_legend_param = list(title="Pearson's r",
+                                            direction = "horizontal",
+                                            title_position = "topcenter",
+                                            legend_height = unit(4, "cm")),
+                
+                # No clustering
+                cluster_rows=FALSE, 
+                cluster_columns=FALSE)
+  bc_hmap <- Heatmap(bc_m, 
+                       
+                # Colour scale       
+                col=circlize::colorRamp2(c(0,1), c("white", lighten("blue",0.25))),
+                
+                # Define cell contents
+                cell_fun = function(j, i, x, y, width, height, fill) {
+                  
+                  grid.text(sprintf("%.2f", bc_m[i, j]), x, y, gp = gpar(fontsize = 16))
+                
+                },
+                heatmap_legend_param = list(title="Bray-Curtis Distance",
+                                            direction = "horizontal",
+                                            title_position = "topcenter",
+                                            legend_height = unit(4, "cm")),
+                
+                # No clustering
+                cluster_rows=FALSE, 
+                cluster_columns=FALSE)
+  
+  # Plot heatmap
+  png(paste0(eda_dir,week,".hmap.microorganism.pairwise_similarity.pearsons_r.jpeg"),width=750,height=750,units="px")
+  draw(corr_hmap, heatmap_legend_side="top")
+  dev.off()
+  
+  # Plot heatmap
+  png(paste0(eda_dir,week,".hmap.microorganism.pairwise_dissimilarity.bray-curtis.jpeg"),width=750,height=750,units="px")
+  draw(bc_hmap, heatmap_legend_side="top")
+  dev.off()
+}
+
+```
+
+### Stratified calcprotectin distribution
+
+```{r}
+
+# Get correct ordering of Timings
+all_data$Weeks <- factor(all_data$Weeks, levels=c("2_week","3_week","5_week"))
+
+# Boxplots
+## Calprotectin
+gen_plt <- NiceBoxPlot(all_data, x_val="Gender", y_val="calprotectine", facet_val_cols="Weeks", col_val="Weeks", cols=week_colors,
+                       x_title="Gender", y_title="Calprotectin", max_y=600, min_y=0, facet_by_separate_plot=FALSE)
+fed_plt <- NiceBoxPlot(all_data, x_val="FEEDING", y_val="calprotectine", facet_val_cols="Weeks", col_val="Weeks", cols=week_colors,
+                       x_title="Feeding Method", y_title="Calprotectin", max_y=600, min_y=0, facet_by_separate_plot=FALSE)
+vit_plt <- NiceBoxPlot(all_data, x_val="Treatment.during.pregnancy", y_val="calprotectine", facet_val_cols="Weeks", col_val="Weeks", cols=week_colors,
+                       x_title="", y_title="Calprotectin", max_y=600, min_y=0, facet_by_separate_plot=FALSE)
+del_plt <- NiceBoxPlot(all_data, x_val="Delivery", y_val="calprotectine", facet_val_cols="Weeks", col_val="Weeks", cols=week_colors,
+                       x_title="", y_title="Delivery Method", max_y=600, min_y=0, facet_by_separate_plot=FALSE)
+
+
+# Save
+ggsave(paste0(eda_dir, "calprotectin_by_gender.boxplots.jpeg"), gen_plt, units="px", height=2000, width=4800)
+ggsave(paste0(eda_dir, "calprotectin_by_feeding.boxplots.jpeg"), fed_plt, units="px", height=2000, width=4800)
+ggsave(paste0(eda_dir, "calprotectin_by_multivit_treat.boxplots.jpeg"), vit_plt, units="px", height=2000, width=4800)
+ggsave(paste0(eda_dir, "calprotectin_by_delivery.boxplots.jpeg"), del_plt, units="px", height=2000, width=4800)
+
+```
+
+### Feeding (formula different from mixed)
+
+```{r}
+
+# Run ANOVA
+if (mixed_is_formula) {
+  
+  # Loop over weeks
+  for (week in unique(all_data$Weeks)) {
+    
+    print(week)
+    
+    # ANOVA
+    aov_res <- aov(calprotectine ~ FEEDING, data=all_data[all_data$Weeks == week,])
+    print(TukeyHSD(aov_res))
+  }
+  
+}
+
+```
+
+### Stratified birthweight distribution
+
+```{r}
+
+## Birthweight
+gen_plt <- NiceBoxPlot(data.frame(metadata, DUMMY="DUMMY"), x_val="Gender", y_val="Birthweight", facet_val_cols="DUMMY", col_val="DUMMY", cols=c("DUMMY"="salmon"),
+                       x_title="Gender", y_title="Birthweight", min_x=2000, max_y=4500) + ggtitle("") + stat_compare_means(comparisons = list(c(1,2)), label = "p.format", method="t.test")
+fed_plt <- NiceBoxPlot(data.frame(metadata, DUMMY="DUMMY"), x_val="FEEDING", y_val="Birthweight", facet_val_cols="DUMMY", col_val="DUMMY", cols=c("DUMMY"="salmon"),
+                       x_title="Feeding Method", y_title="Birthweight", min_x=2000, max_y=4500) + ggtitle("") + stat_compare_means(comparisons = list(c(1,2)), label = "p.format", method="t.test")
+vit_plt <- NiceBoxPlot(data.frame(metadata, DUMMY="DUMMY"), x_val="Treatment.during.pregnancy", y_val="Birthweight", facet_val_cols="DUMMY", col_val="DUMMY", cols=c("DUMMY"="salmon"),
+                       x_title="Multivitamin Supplementation\nDuring Pregnancy", y_title="Birthweight", min_x=2000, max_y=4500) + ggtitle("") + stat_compare_means(comparisons = list(c(1,2)), label = "p.format", method="t.test")
+del_plt <- NiceBoxPlot(data.frame(metadata, DUMMY="DUMMY"), x_val="Delivery", y_val="Birthweight", facet_val_cols="DUMMY", col_val="DUMMY", cols=c("DUMMY"="salmon"),
+                       x_title="Delivery Method", y_title="Birthweight", min_x=2000, max_y=4500) + ggtitle("") + stat_compare_means(comparisons = list(c(1,2)), label = "p.format", method="t.test")
+
+# Save
+ggsave(paste0(eda_dir, "birthweight_by_gender.boxplots.jpeg"), gen_plt, units="px", height=2000, width=1600)
+ggsave(paste0(eda_dir, "birthweight_by_feeding_type.boxplots.jpeg"), fed_plt, units="px", height=2000, width=1600)
+ggsave(paste0(eda_dir, "birthweight_by_multivit_treat.boxplots.jpeg"), vit_plt, units="px", height=2000, width=1600)
+ggsave(paste0(eda_dir, "birthweight_by_delivery.boxplots.jpeg"), del_plt, units="px", height=2000, width=1600)
+
+```
+
+### Stratified apgar distribution
+
+```{r}
+
+# Get correct ordering of Timings
+all_data$Weeks <- factor(all_data$Weeks, levels=c("2_week","3_week","5_week"))
+
+# Boxplots
+## apgar 1
+gen_plt <- NiceBoxPlot(all_data[all_data$Weeks == "2_week",], x_val="Gender", y_val="Apgar.1", facet_val_cols="Weeks", col_val="Weeks", cols=week_colors,
+                       x_title="Gender", y_title="APGAR 1") + ggtitle("")
+fed_plt <- NiceBoxPlot(all_data[all_data$Weeks == "2_week",], x_val="FEEDING", y_val="Apgar.1", facet_val_cols="Weeks", col_val="Weeks", cols=week_colors,
+                       x_title="Feeding Method", y_title="APGAR 1") + ggtitle("")
+vit_plt <- NiceBoxPlot(all_data[all_data$Weeks == "2_week",], x_val="Treatment.during.pregnancy", y_val="Apgar.1", facet_val_cols="Weeks", col_val="Weeks", cols=week_colors,
+                       x_title="", y_title="APGAR 1") + ggtitle("")
+## Just APGAR 1 distribution
+apgar.dist_plt <- NiceBoxPlot(data.frame(metadata, DUMMY="DUMMY"), x_val="DUMMY", y_val="Apgar.1", facet_val_cols="DUMMY", col_val="DUMMY",
+                              x_title="", y_title="APGAR 1", cols=c("DUMMY"="darkred")) + ggtitle("") + theme(axis.text.x = element_blank())
+
+# Save
+ggsave(paste0(eda_dir, "apgar1_by_gender.boxplots.jpeg"), gen_plt, units="px", height=2000, width=1600)
+ggsave(paste0(eda_dir, "apgar1_by_feeding.boxplots.jpeg"), fed_plt, units="px", height=2000, width=1600)
+ggsave(paste0(eda_dir, "apgar1_by_multivit_treat.boxplots.jpeg"), vit_plt, units="px", height=2000, width=1600)
+ggsave(paste0(eda_dir, "apgar1_distribution.boxplot.jpeg"), apgar.dist_plt, units="px", height=2000, width=1200)
+
+## apgar 5
+gen_plt <- NiceBoxPlot(all_data[all_data$Weeks == "2_week",], x_val="Gender", y_val="Apgar.5", facet_val_cols="Weeks", col_val="Weeks", cols=week_colors,
+                       x_title="Gender", y_title="APGAR 5") + ggtitle("")
+fed_plt <- NiceBoxPlot(all_data[all_data$Weeks == "2_week",], x_val="FEEDING", y_val="Apgar.5", facet_val_cols="Weeks", col_val="Weeks", cols=week_colors,
+                       x_title="Feeding Method", y_title="APGAR 5")
+vit_plt <- NiceBoxPlot(all_data[all_data$Weeks == "2_week",], x_val="Treatment.during.pregnancy", y_val="Apgar.5", facet_val_cols="Weeks", col_val="Weeks", cols=week_colors,
+                       x_title="", y_title="APGAR 5") + ggtitle("")
+## JUST APGAR 5 distribution
+apgar.dist_plt <- NiceBoxPlot(data.frame(metadata, DUMMY="DUMMY"), x_val="DUMMY", y_val="Apgar.5", facet_val_cols="DUMMY", col_val="DUMMY",
+                              x_title="", y_title="APGAR 5", cols=c("DUMMY"="darkred")) + ggtitle("") + theme(axis.text.x = element_blank())
+
+# Save
+ggsave(paste0(eda_dir, "apgar5_by_gender.boxplots.jpeg"), gen_plt, units="px", height=2000, width=1600)
+ggsave(paste0(eda_dir, "apgar5_by_feeding.boxplots.jpeg"), fed_plt, units="px", height=2000, width=1600)
+ggsave(paste0(eda_dir, "apgar5_by_multivit_treat.boxplots.jpeg"), vit_plt, units="px", height=2000, width=1600)
+ggsave(paste0(eda_dir, "apgar5_distribution.boxplot.jpeg"), apgar.dist_plt, units="px", height=2000, width=1200)
+
+
+```
+
+### Histogram of apgar
+
+```{r}
+
+hist(metadata$`Apgar 1`, breaks=10)
+hist(metadata$`Apgar 5`, breaks=10)
+
+```
+
+### Stratified CFUs for each organism
+
+```{r}
+
+# Loop over orgnaisms
+for (org in orgs_of_interest) {
+  
+  # Plot
+  gen_plt <- NiceBoxPlot(all_data, x_val="Gender", y_val=org, facet_val_cols="Weeks", col_val="Weeks", cols=week_colors,
+                         x_title="Gender", y_title="CFU", max_y=(max(as.matrix(all_data[,orgs_of_interest])) + 5), min_y=0)
+  fed_plt <- NiceBoxPlot(all_data, x_val="FEEDING", y_val=org, facet_val_cols="Weeks", col_val="Weeks", cols=week_colors,
+                         x_title="Feeding Method", y_title="CFU", inc_sig_bracket=FALSE, inc_extra=stat_compare_means(comparisons = list(1:2, 2:3, c(1, 3))),
+                         max_y=(max(as.matrix(all_data[,orgs_of_interest])) + 5), min_y=0)
+  vit_plt <- NiceBoxPlot(all_data, x_val="Treatment.during.pregnancy", y_val=org, facet_val_cols="Weeks", col_val="Weeks", cols=week_colors,
+                         x_title="", y_title="CFU", max_y=(max(as.matrix(all_data[,orgs_of_interest])) + 5), min_y=0)
+  del_plt <- NiceBoxPlot(all_data, x_val="Delivery", y_val=org, facet_val_cols="Weeks", col_val="Weeks", cols=week_colors,
+                         x_title="", y_title="CFU", max_y=(max(as.matrix(all_data[,orgs_of_interest])) + 5), min_y=0)
+
+  # Save
+  ggsave(paste0(eda_dir, "cfus/", org, "/", org, ".cfu_by_gender.boxplots.jpeg"), gen_plt, units="px", height=2000, width=4800)
+  ggsave(paste0(eda_dir, "cfus/", org, "/", org, ".cfu_by_feeding.boxplots.jpeg"), fed_plt, units="px", height=2000, width=4800)
+  ggsave(paste0(eda_dir, "cfus/", org, "/", org, ".cfu_by_multivit_treat.boxplots.jpeg"), vit_plt, units="px", height=2000, width=4800)
+  ggsave(paste0(eda_dir, "cfus/", org, "/", org, ".cfu_by_delivery.boxplots.jpeg"), del_plt, units="px", height=2000, width=4800)
+
+}
+
+```
+
+### Plot caprotectine over time
+
+```{r}
+
+# Plot
+plt <- ggplot(tall.mbiome_data, aes(x=WEEKS, y=CALPROTECTINE, color=PATIENT_ID, fill=PATIENT_ID, group=PATIENT_ORG)) + 
+              geom_line() + geom_point(color="black", shape=21) + 
+              xlab("Weeks") + ylab("Calprotectin") + 
+              theme_bw(base_size=36) + theme(legend.position="none",
+                                             axis.title=element_text(size=42),
+                                             plot.title=element_text(size=72))
+
+# Save
+ggsave(paste0(eda_dir, "calprotectine_vs_weeks.colby_patient.lineplt.jpeg"), width=3000, height=3000, units="px")
+
+# Plot
+plt <- ggplot(tall.mbiome_data, aes(x=WEEKS^2, y=CALPROTECTINE, color=PATIENT_ID, fill=PATIENT_ID, group=PATIENT_ORG)) + 
+              geom_line() + geom_point(color="black", shape=21) + 
+              xlab("Weeks^2") + ylab("Calprotectin") +
+              theme_bw(base_size=36) + theme(legend.position="none",
+                                             axis.title=element_text(size=42),
+                                             plot.title=element_text(size=72))
+
+# Save
+ggsave(paste0(eda_dir, "calprotectine_vs_week_squared.colby_patient.lineplt.jpeg"), width=3000, height=2000, units="px")
+
+```
+
+### Plot bacteria over time/calprotectine (split by organism)
+
+```{r}
+
+# Plot
+plt <- ggplot(tall.mbiome_data, aes(x=WEEKS, y=CFU, color=PATIENT_ID, fill=PATIENT_ID, group=PATIENT_ID)) + 
+              geom_line() + geom_point(color="black", shape=21) + 
+              facet_wrap( ~ ORGANISM, ncol=5) +
+              scale_y_continuous(breaks=seq(0, max(tall.mbiome_data$CFU), 2)) +
+              # scale_x_continuous(breaks=c(2,3,5)) +
+              theme_bw(base_size=16) + theme(legend.position="none",
+                                             axis.title=element_text(size=24))
+
+# Save
+ggsave(paste0(eda_dir, "organism_vs_weeks.colby_patient.split_by_organism.lineplt.jpeg"), width=5000, height=3000, units="px")
+
+# Plot
+plt <- ggplot(tall.mbiome_data, aes(x=CFU, y=CALPROTECTINE, color=PATIENT_ID, fill=PATIENT_ID, group=PATIENT_ID)) + 
+              geom_line() + geom_point(color="black", shape=21) + 
+              facet_wrap( ~ ORGANISM, ncol=5) +
+              scale_x_continuous(breaks=seq(0, max(tall.mbiome_data$CFU), 2)) +
+              # scale_x_continuous(breaks=c(2,3,5)) +
+              ylab("Calprotectin") +
+              theme_bw(base_size=16) + theme(legend.position="none",
+                                             axis.title=element_text(size=24))
+
+# Save
+ggsave(paste0(eda_dir, "organism_vs_calprotectine.colby_patient.split_by_organism.lineplt.jpeg"), width=5000, height=2000, units="px")
+
+```
+
+### Plot bacteria over time/calprotectine (split by patient)
+
+```{r}
+
+# Plot
+tall.mbiome_data$PATIENT_ID <- factor(tall.mbiome_data$PATIENT_ID, levels=unique(tall.mbiome_data$PATIENT_ID))
+plt <- ggplot(tall.mbiome_data, aes(x=WEEKS, y=CFU, color=ORGANISM, fill=ORGANISM, group=ORGANISM)) + 
+              geom_line() + geom_point(color="black", shape=21) + 
+              scale_fill_manual(values=org_colors) + scale_color_manual(values=org_colors) +
+              facet_wrap( ~ PATIENT_ID, ncol=8) +
+              scale_y_continuous(breaks=seq(0, max(tall.mbiome_data$CFU), 2)) +
+              # scale_x_continuous(breaks=c(2,3,5)) +
+              theme_bw(base_size=16) + theme(legend.position="none",
+                                             axis.title=element_text(size=24))
+
+# Save
+ggsave(paste0(eda_dir, "organism_vs_weeks.colby_organism.split_by_patient.lineplt.jpeg"), width=5000, height=5000, units="px")
+
+# Plot
+plt <- ggplot(tall.mbiome_data, aes(x=CFU, y=CALPROTECTINE, color=ORGANISM, fill=ORGANISM, group=ORGANISM)) + 
+              geom_line() + geom_point(color="black", shape=21) + 
+              scale_fill_manual(values=org_colors) + scale_color_manual(values=org_colors) +
+              facet_wrap( ~ PATIENT_ID, ncol=8) +
+              scale_x_continuous(breaks=seq(0, max(tall.mbiome_data$CFU), 2)) +
+              # scale_x_continuous(breaks=c(2,3,5)) +
+              theme_bw(base_size=16) + theme(legend.position="none",
+                                             axis.title=element_text(size=24))
+
+# Save
+ggsave(paste0(eda_dir, "organism_vs_calprotectine.colby_organism.split_by_patient.lineplt.jpeg"), width=5000, height=5000, units="px")
+
+```
+
+### Save data
+
+```{r}
+
+# Save data
+colnames(all_data) <- gsub("\n","_",colnames(all_data))
+all_data$`Offset date of birth` <- as.character(all_data$`Offset date of birth`)
+tall.mbiome_data$ORGANISM <- gsub("\n","_",tall.mbiome_data$ORGANISM)
+tall.mbiome_data$PATIENT_ORG <- gsub("\n","_",tall.mbiome_data$PATIENT_ORG)
+
+# Save
+write.table(data.scores, paste0(res_dir,"microbiome_cfus_data.nmds_scores.tsv"),sep="\t", quote=FALSE, row.names=FALSE)
+write.table(all_data, paste0(data_dir,"all_data.combined_mbiome_metadata.zero_cfu_orgs_removed.tsv"), sep="\t", quote=FALSE)
+write.table(metadata, paste0(data_dir,"sample_metadata.tsv"), sep="\t", quote=FALSE)
+write.table(tall.mbiome_data, paste0(data_dir,"microbiome_cfus_data.tall_format.zero_cfu_orgs_removed.tsv"), sep="\t", quote=FALSE)
+table(all_data$FEEDING)
+
+```
+
+
+
+
+
